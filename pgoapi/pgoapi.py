@@ -23,8 +23,6 @@ OR OTHER DEALINGS IN THE SOFTWARE.
 Author: tjado <https://github.com/tejado>
 """
 
-from __future__ import absolute_import
-
 import re
 import six
 import logging
@@ -51,7 +49,14 @@ class PGoApi:
 
         self._auth_provider = None
         if provider is not None and ((username is not None and password is not None) or (oauth2_refresh_token is not None)):
-            self.set_authentication(provider, oauth2_refresh_token, username, password)
+            aio.get_event_loop().run_until_complete(
+                self.set_authentication(
+                    provider,
+                    oauth2_refresh_token,
+                    username,
+                    password,
+                ),
+            )
 
         self.set_api_endpoint("pgorelease.nianticlabs.com/plfe")
 
@@ -64,7 +69,7 @@ class PGoApi:
     def set_logger(self, logger=None):
         self.log = logger or logging.getLogger(__name__)
 
-    def set_authentication(self, provider=None, oauth2_refresh_token=None, username=None, password=None):
+    async def set_authentication(self, provider=None, oauth2_refresh_token=None, username=None, password=None):
         if provider == 'ptc':
             self._auth_provider = AuthPtc()
         elif provider == 'google':
@@ -79,7 +84,7 @@ class PGoApi:
         if oauth2_refresh_token is not None:
             self._auth_provider.set_refresh_token(oauth2_refresh_token)
         elif username is not None and password is not None:
-            self._auth_provider.user_login(username, password)
+            await self._auth_provider.user_login(username, password)
         else:
             raise AuthException("Invalid Credential Input - Please provide username/password or an oauth2 refresh token")
 
@@ -116,17 +121,17 @@ class PGoApi:
         return self._signature_lib
 
     def __getattr__(self, func):
-        def function(**kwargs):
+        async def function(**kwargs):
             request = self.create_request()
             getattr(request, func)(_call_direct=True, **kwargs )
-            return request.call()
+            return await request.call()
 
         if func.upper() in RequestType.keys():
             return function
         else:
             raise AttributeError
 
-    def app_simulation_login(self):
+    async def app_simulation_login(self):
         self.log.info('Starting RPC login sequence (app simulation)')
 
         # making a standard call, like it is also done by the client
@@ -138,7 +143,7 @@ class PGoApi:
         request.check_awarded_badges()
         request.download_settings(hash="54b359c97e46900f87211ef6e6dd0b7f2a3ea1f5")
 
-        response = request.call()
+        response = await request.call()
 
         self.log.info('Finished RPC login sequence (app simulation)')
 
@@ -147,7 +152,7 @@ class PGoApi:
     """
     The login function is not needed anymore but still in the code for backward compatibility"
     """
-    def login(self, provider, username, password, lat=None, lng=None, alt=None, app_simulation=True):
+    async def login(self, provider, username, password, lat=None, lng=None, alt=None, app_simulation=True):
 
         if lat is not None and lng is not None and alt is not None:
             self._position_lat = lat
@@ -155,16 +160,16 @@ class PGoApi:
             self._position_alt = alt
 
         try:
-            self.set_authentication(provider, username=username, password=password)
+            await self.set_authentication(provider, username=username, password=password)
         except AuthException as e:
             self.log.error('Login process failed: %s', e)
             return False
 
         if app_simulation:
-            response = self.app_simulation_login()
+            response = await self.app_simulation_login()
         else:
             self.log.info('Starting minimal RPC login sequence')
-            response = self.get_player()
+            response = await self.get_player()
             self.log.info('Finished minimal RPC login sequence')
 
         if not response:
@@ -192,7 +197,7 @@ class PGoApiRequest:
 
         self._req_method_list = []
 
-    def call(self):
+    async def call(self):
         if not self._req_method_list:
             raise EmptySubrequestChainException()
 
@@ -217,7 +222,7 @@ class PGoApiRequest:
             execute = False
 
             try:
-                response = request.request(self._api_endpoint, self._req_method_list, self.get_position())
+                response = await request.request(self._api_endpoint, self._req_method_list, self.get_position())
             except AuthTokenExpiredException as e:
                 """
                 This exception only occures if the OAUTH service provider (google/ptc) didn't send any expiration date
@@ -225,7 +230,7 @@ class PGoApiRequest:
                 """
                 try:
                     self.log.info('Access Token rejected! Requesting new one...')
-                    self._auth_provider.get_access_token(force_refresh=True)
+                    await self._auth_provider.get_access_token(force_refresh=True)
                 except:
                     error = 'Request for new Access Token failed! Logged out...'
                     self.log.error(error)

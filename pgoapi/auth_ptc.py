@@ -27,6 +27,8 @@ from __future__ import absolute_import
 from future.standard_library import install_aliases
 install_aliases()
 
+import asyncio as aio
+import aiohttp
 import re
 import six
 import json
@@ -47,59 +49,67 @@ class AuthPtc(Auth):
 
     def __init__(self):
         Auth.__init__(self)
-        
+
         self._auth_provider = 'ptc'
-        
+
         self._session = requests.session()
         self._session.verify = True
 
-    def user_login(self, username, password):
+    async def user_login(self, username, password):
         self.log.info('PTC User Login for: {}'.format(username))
 
         if not isinstance(username, six.string_types) or not isinstance(password, six.string_types):
             raise AuthException("Username/password not correctly specified")
-        
+
         head = {'User-Agent': 'niantic'}
-        r = self._session.get(self.PTC_LOGIN_URL, headers=head)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                self.PTC_LOGIN_URL,
+                headers=head,
+            ) as resp:
+                content = await resp.text()
 
-        try:
-            jdata = json.loads(r.content.decode('utf-8'))
-            data = {
-                'lt': jdata['lt'],
-                'execution': jdata['execution'],
-                '_eventId': 'submit',
-                'username': username,
-                'password': password,
-            }
-        except ValueError as e:
-            self.log.error('PTC User Login Error - Field missing in response: %s', e)
-            return False
-        except KeyError as e:
-            self.log.error('PTC User Login Error - Field missing in response.content: %s', e)
-            return False
-
-        r1 = self._session.post(self.PTC_LOGIN_URL, data=data, headers=head)
-
-        ticket = None
-        try:
-            ticket = re.sub('.*ticket=', '', r1.history[0].headers['Location'])
-        except Exception as e:
             try:
-                self.log.error('Could not retrieve token: %s', r1.json()['errors'][0])
-            except Exception as e:
-                self.log.error('Could not retrieve token! (%s)', e)
-            return False
+                jdata = json.loads(content)
+                data = {
+                    'lt': jdata['lt'],
+                    'execution': jdata['execution'],
+                    '_eventId': 'submit',
+                    'username': username,
+                    'password': password,
+                }
+            except ValueError as e:
+                self.log.error('PTC User Login Error - Field missing in response: %s', e)
+                return False
+            except KeyError as e:
+                self.log.error('PTC User Login Error - Field missing in response.content: %s', e)
+                return False
 
-        self._refresh_token = ticket
-        self.log.info('PTC User Login successful.')
+            async with session.post(
+                self.PTC_LOGIN_URL,
+                data=data,
+                headers=head,
+            ) as r1:
+                ticket = None
+                try:
+                    ticket = re.sub('.*ticket=', '', r1.history[0].headers['Location'])
+                except Exception as e:
+                    try:
+                        self.log.error('Could not retrieve token: %s', r1.json()['errors'][0])
+                    except Exception as e:
+                        self.log.error('Could not retrieve token! (%s)', e)
+                    return False
 
-        self.get_access_token()
+                self._refresh_token = ticket
+                self.log.info('PTC User Login successful.')
+
+        await self.get_access_token()
 
     def set_refresh_token(self, refresh_token):
         self.log.info('PTC Refresh Token provided by user')
         self._refresh_token = refresh_token
 
-    def get_access_token(self, force_refresh = False):
+    async def get_access_token(self, force_refresh = False):
         token_validity = self.check_access_token()
 
         if token_validity is True and force_refresh is False:
@@ -118,31 +128,31 @@ class AuthPtc(Auth):
                 'grant_type': 'refresh_token',
                 'code': self._refresh_token,
             }
-            
-            r2 = self._session.post(self.PTC_LOGIN_OAUTH, data=data1)
 
-            qs = r2.content.decode('utf-8')
-            token_data = parse_qs(qs)
-            
-            access_token = token_data.get('access_token', None)
-            if access_token is not None:
-                self._access_token = access_token[0]
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.PTC_LOGIN_OAUTH,
+                    data=data1,
+                ) as r2:
+                    qs = await r2.text()
+                    token_data = parse_qs(qs)
 
-                now_s = get_time()
-                expires = int(token_data.get('expires', [0])[0])
-                if expires > 0:
-                    self._access_token_expiry = expires + now_s
-                else:
-                    self._access_token_expiry = 0
+                    access_token = token_data.get('access_token', None)
+                    if access_token is not None:
+                        self._access_token = access_token[0]
 
-                self._login = True
+                        now_s = get_time()
+                        expires = int(token_data.get('expires', [0])[0])
+                        if expires > 0:
+                            self._access_token_expiry = expires + now_s
+                        else:
+                            self._access_token_expiry = 0
 
-                self.log.info('PTC Access Token successfully retrieved.')
-                self.log.debug('PTC Access Token: %s...', self._access_token[:25])
-            else:
-                self._access_token = None
-                self._login = False
-                raise AuthException("Could not retrieve a PTC Access Token")
+                        self._login = True
 
-
-        
+                        self.log.info('PTC Access Token successfully retrieved.')
+                        self.log.debug('PTC Access Token: %s...', self._access_token[:25])
+                    else:
+                        self._access_token = None
+                        self._login = False
+                        raise AuthException("Could not retrieve a PTC Access Token")

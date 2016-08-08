@@ -25,6 +25,8 @@ Author: tjado <https://github.com/tejado>
 
 from __future__ import absolute_import
 
+import asyncio as aio
+import aiohttp
 import os
 import re
 import time
@@ -62,10 +64,6 @@ class RpcApi:
 
         self.log = logging.getLogger(__name__)
 
-        self._session = requests.session()
-        self._session.headers.update({'User-Agent': 'Niantic App'})
-        self._session.verify = True
-
         self._auth_provider = auth_provider
 
         """ mystic unknown6 - revolved by PokemonGoDev """
@@ -92,11 +90,14 @@ class RpcApi:
 
         return RpcApi.RPC_ID
 
-    def decode_raw(self, raw):
+    async def decode_raw(self, raw):
         output = error = None
         try:
-            process = subprocess.Popen(['protoc', '--decode_raw'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
-            output, error = process.communicate(raw)
+            process = await aio.create_subprocess_exec(
+                *['protoc', '--decode_raw'],
+                close_fds=True,
+            )
+            output, error = await process.communicate(raw)
         except:
             output = "Couldn't find protoc in your environment OR other issue..."
 
@@ -107,26 +108,46 @@ class RpcApi:
         class_ = getattr(import_module(module_), class_)
         return class_
 
-    def _make_rpc(self, endpoint, request_proto_plain):
+    async def _make_rpc(self, endpoint, request_proto_plain):
         self.log.debug('Execution of RPC')
 
         request_proto_serialized = request_proto_plain.SerializeToString()
         try:
-            http_response = self._session.post(endpoint, data=request_proto_serialized)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    endpoint,
+                    data=request_proto_serialized,
+                    headers={'User-Agent': 'Niantic App'},
+                ) as resp:
+                    if resp.status == 403:
+                        raise ServerSideAccessForbiddenException("Seems your IP Address is banned or something else went badly wrong...")
+                    elif resp.status == 502:
+                        raise ServerBusyOrOfflineException("502: Bad Gateway")
+                    elif resp.status != 200:
+                        error = 'Unexpected HTTP server response - needs 200 got {}'.format(resp.status)
+                        self.log.warning(error)
+                        content = await resp.read()
+                        self.log.debug('HTTP output: \n%s', content.decode('utf-8'))
+                        raise UnexpectedResponseException(error)
+
+                    content = await resp.read()
+                    if content is None:
+                        self.log.warning('Empty server response!')
+                        return False
         except requests.exceptions.ConnectionError as e:
             raise ServerBusyOrOfflineException(e)
 
-        return http_response
+        return content
 
-    def request(self, endpoint, subrequests, player_position):
+    async def request(self, endpoint, subrequests, player_position):
 
         if not self._auth_provider or self._auth_provider.is_login() is False:
             raise NotLoggedInException()
 
-        request_proto = self._build_main_request(subrequests, player_position)
-        response = self._make_rpc(endpoint, request_proto)
+        request_proto = await self._build_main_request(subrequests, player_position)
+        content = await self._make_rpc(endpoint, request_proto)
 
-        response_dict = self._parse_main_response(response, subrequests)
+        response_dict = await self._parse_main_response(content, subrequests)
 
         self.check_authentication(response_dict)
 
@@ -169,7 +190,7 @@ class RpcApi:
             else:
                 self.log.debug('Received Session Ticket valid for %02d:%02d:%02d hours (%s < %s)', h, m, s, now_ms, auth_ticket['expire_timestamp_ms'])
 
-    def _build_main_request(self, subrequests, player_position=None):
+    async def _build_main_request(self, subrequests, player_position=None):
         self.log.debug('Generating main RPC request...')
 
         request = RequestEnvelope()
@@ -213,7 +234,7 @@ class RpcApi:
         else:
             self.log.debug('No Session Ticket found - using OAUTH Access Token')
             request.auth_info.provider = self._auth_provider.get_name()
-            request.auth_info.token.contents = self._auth_provider.get_access_token()
+            request.auth_info.token.contents = await self._auth_provider.get_access_token()
             request.auth_info.token.unknown2 = 59
 
         # unknown stuff
@@ -238,35 +259,6 @@ class RpcApi:
         self._signature_lib.encrypt(signature_plain, len(signature_plain), iv, 32, ctypes.byref(output), ctypes.byref(output_size))
         signature = b''.join(list(map(lambda x: six.int2byte(x), output)))
         return signature
-
-    def _build_main_request_orig(self, subrequests, player_position=None):
-        self.log.debug('Generating main RPC request...')
-
-        request = RequestEnvelope()
-        request.status_code = 2
-        request.request_id = self.get_rpc_id()
-
-        request = self._build_sub_requests(request, subrequests)
-
-        if player_position is not None:
-            request.latitude, request.longitude, request.altitude = player_position
-
-        ticket = self._auth_provider.get_ticket()
-        if ticket:
-            self.log.debug('Found Session Ticket - using this instead of oauth token')
-            request.auth_ticket.expire_timestamp_ms, request.auth_ticket.start, request.auth_ticket.end = ticket
-        else:
-            self.log.debug('No Session Ticket found - using OAUTH Access Token')
-            request.auth_info.provider = self._auth_provider.get_name()
-            request.auth_info.token.contents = self._auth_provider.get_access_token()
-            request.auth_info.token.unknown2 = 59
-
-        # unknown stuff
-        request.unknown12 = 3352
-
-        self.log.debug('Generated protobuf request: \n\r%s', request)
-
-        return request
 
     def _build_sub_requests(self, mainrequest, subrequest_list):
         self.log.debug('Generating sub RPC requests...')
@@ -325,35 +317,22 @@ class RpcApi:
 
         return mainrequest
 
-    def _parse_main_response(self, response_raw, subrequests):
+    async def _parse_main_response(self, content, subrequests):
         self.log.debug('Parsing main RPC response...')
-
-        if response_raw.status_code == 403:
-            raise ServerSideAccessForbiddenException("Seems your IP Address is banned or something else went badly wrong...")
-        elif response_raw.status_code == 502:
-            raise ServerBusyOrOfflineException("502: Bad Gateway")
-        elif response_raw.status_code != 200:
-            error = 'Unexpected HTTP server response - needs 200 got {}'.format(response_raw.status_code)
-            self.log.warning(error)
-            self.log.debug('HTTP output: \n%s', response_raw.content.decode('utf-8'))
-            raise UnexpectedResponseException(error)
-
-        if response_raw.content is None:
-            self.log.warning('Empty server response!')
-            return False
 
         response_proto = ResponseEnvelope()
         try:
-            response_proto.ParseFromString(response_raw.content)
+            response_proto.ParseFromString(content)
         except message.DecodeError as e:
             self.log.warning('Could not parse response: %s', e)
             return False
 
         self.log.debug('Protobuf structure of rpc response:\n\r%s', response_proto)
-        try:
-            self.log.debug('Decode raw over protoc (protoc has to be in your PATH):\n\r%s', self.decode_raw(response_raw.content).decode('utf-8'))
-        except:
-            self.log.debug('Error during protoc parsing - ignored.')
+        # try:
+        #     decoded = await self.decode_raw(content)
+        #     self.log.debug('Decode raw over protoc (protoc has to be in your PATH):\n\r%s', decoded.decode('utf-8'))
+        # except:
+        #     self.log.debug('Error during protoc parsing - ignored.')
 
         response_proto_dict = protobuf_to_dict(response_proto)
         response_proto_dict = self._parse_sub_responses(response_proto, subrequests, response_proto_dict)
